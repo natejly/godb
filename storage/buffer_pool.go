@@ -1,60 +1,262 @@
 package storage
 
 import (
+	"fmt"
+	"sync"
+	"time"
+	
+	"github.com/puzpuzpuz/xsync/v3"
 	"mit.edu/dsg/godb/common"
 )
 
-// BufferPool manages the reading and writing of database pages between the DiskFileManager and memory.
-// It acts as a central cache to keep "hot" pages in memory with fixed capacity and selectively evicts
-// pages to disk when the pool becomes full. Users will need to coordinate concurrent access to pages
-// using page-level latches and metadata (which you should define in page.go). All methods
-// must be thread-safe, as multiple threads will request the same or different pages concurrently.
-// To get full credit, you likely need to do better than coarse-grained latching (i.e., a global latch for the entire
-// BufferPool instance).
 type BufferPool struct {
-	// add more fields here...
+	numPages       int
+	storageManager DBFileManager
+	frames         []*PageFrame
+	pageTable      *xsync.MapOf[common.PageID, *PageFrame]
+	clockHand      int
+	clockMutex     sync.Mutex
+	
+	// loadingPages tracks pages currently being loaded to prevent duplicate loads
+	loadingPages   *xsync.MapOf[common.PageID, chan struct{}]
 }
 
-// NewBufferPool creates a new BufferPool with a fixed capacity defined by numPages. It requires a
-// storageManager to handle the underlying disk I/O operations.
 func NewBufferPool(numPages int, storageManager DBFileManager) *BufferPool {
-	panic("unimplemented")
+	frames := make([]*PageFrame, numPages)
+	for i := 0; i < numPages; i++ {
+		frames[i] = &PageFrame{}
+	}
+	
+	return &BufferPool{
+		numPages:       numPages,
+		storageManager: storageManager,
+		frames:         frames,
+		pageTable:      xsync.NewMapOf[common.PageID, *PageFrame](),
+		clockHand:      0,
+		loadingPages:   xsync.NewMapOf[common.PageID, chan struct{}](),
+	}
 }
 
-// StorageManager returns the underlying disk manager.
 func (bp *BufferPool) StorageManager() DBFileManager {
-	panic("unimplemented")
+	return bp.storageManager
 }
 
-// GetPage retrieves a page from the buffer pool, ensuring it is pinned (i.e. prevented from eviction until
-// unpinned) and ready for use. If the page is already in the pool, the cached bytes are returned. If the page is not
-// present, the method must first make space by selecting a victim frame to evict
-// (potentially writing it to disk if dirty), and then read the requested page from disk into that frame.
 func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
-	panic("unimplemented")
+	for {
+		// Fast path: check if page is already in buffer pool
+		if frame, exists := bp.pageTable.Load(pageID); exists {
+			// Pin the frame first
+			frame.pinCount.Add(1)
+			
+			// Verify the frame still holds our page (could have been evicted between Load and Add)
+			frame.metaMutex.Lock()
+			currentPageID := frame.pageID
+			frame.metaMutex.Unlock()
+			
+			if currentPageID == pageID {
+				// Set reference bit for Clock algorithm (scan resistance)
+				frame.refBit.Store(true)
+				return frame, nil
+			}
+			
+			// Frame was evicted from under us, unpin and retry
+			frame.pinCount.Add(-1)
+			continue
+		}
+		
+		// Check if another goroutine is already loading this page
+		if waitCh, loading := bp.loadingPages.Load(pageID); loading {
+			// Wait for the other goroutine to finish loading
+			<-waitCh
+			// Now retry from the beginning
+			continue
+		}
+		
+		// Try to claim the loading slot for this page
+		loadCh := make(chan struct{})
+		if _, loaded := bp.loadingPages.LoadOrStore(pageID, loadCh); loaded {
+			// Another goroutine beat us, retry
+			continue
+		}
+		
+		// We own the loading slot - proceed with loading
+		frame, err := bp.loadPage(pageID)
+		
+		// Release the loading slot
+		close(loadCh)
+		bp.loadingPages.Delete(pageID)
+		
+		if err != nil {
+			return nil, err
+		}
+		return frame, nil
+	}
 }
 
-// UnpinPage indicates that the caller is done using a page. It unpins the page, making the page potentially evictable
-// if no other thread is accessing it. If the setDirty flag is true, the page is marked as modified, ensuring
-// it will be written back to disk before eviction.
+func (bp *BufferPool) loadPage(pageID common.PageID) (*PageFrame, error) {
+	const maxRetries = 1000
+	
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Try to claim a frame
+		frame, oldPageID, isDirty := bp.claimFrame()
+		if frame == nil {
+			// All frames pinned, wait and retry
+			time.Sleep(time.Microsecond * 10)
+			continue
+		}
+		
+		// Hold PageLatch during I/O to prevent anyone from reading/writing the bytes
+		frame.PageLatch.Lock()
+		
+		// Evict old page if needed
+		if oldPageID.Oid != 0 {
+			// IMPORTANT: Write dirty page BEFORE removing from pageTable
+			// Otherwise another thread might load stale data from disk
+			if isDirty {
+				file, err := bp.storageManager.GetDBFile(oldPageID.Oid)
+				if err == nil {
+					file.WritePage(int(oldPageID.PageNum), frame.Bytes[:])
+				}
+			}
+			bp.pageTable.Delete(oldPageID)
+		}
+		
+		// Read new page from disk
+		file, err := bp.storageManager.GetDBFile(pageID.Oid)
+		if err != nil {
+			frame.PageLatch.Unlock()
+			frame.pinCount.Add(-1)
+			return nil, err
+		}
+		
+		err = file.ReadPage(int(pageID.PageNum), frame.Bytes[:])
+		if err != nil {
+			frame.PageLatch.Unlock()
+			frame.pinCount.Add(-1)
+			return nil, err
+		}
+		
+		frame.PageLatch.Unlock()
+		
+		// Update frame metadata
+		frame.metaMutex.Lock()
+		frame.pageID = pageID
+		frame.metaMutex.Unlock()
+		
+		frame.dirty.Store(false)
+		// Don't set refBit on initial load - only set on subsequent accesses
+		// This provides scan resistance: pages accessed only once (scans) get no second chance
+		frame.refBit.Store(false)
+		
+		// Add to page table
+		bp.pageTable.Store(pageID, frame)
+		
+		return frame, nil
+	}
+	
+	return nil, fmt.Errorf("buffer pool full - all pages pinned after %d retries", maxRetries)
+}
+
+// claimFrame finds and claims an unpinned frame using Clock algorithm.
+// Returns the frame (already pinned), the old pageID, and whether it was dirty.
+// Returns nil if no frame is available.
+func (bp *BufferPool) claimFrame() (*PageFrame, common.PageID, bool) {
+	bp.clockMutex.Lock()
+	defer bp.clockMutex.Unlock()
+	
+	// Clock algorithm with scan resistance:
+	// Pass 1: Look for unpinned frame with refBit=false
+	// Pass 2: Clear refBits and try again
+	maxIter := 256
+	if bp.numPages < maxIter {
+		maxIter = bp.numPages
+	}
+	
+	for pass := 0; pass < 2; pass++ {
+		for i := 0; i < maxIter; i++ {
+			idx := bp.clockHand
+			bp.clockHand = (bp.clockHand + 1) % bp.numPages
+			frame := bp.frames[idx]
+			
+			// Skip pinned frames
+			if frame.pinCount.Load() != 0 {
+				continue
+			}
+			
+			// On pass 0, only evict if refBit is false (scan resistance)
+			// On pass 1, clear refBit and evict
+			if pass == 0 && frame.refBit.Load() {
+				frame.refBit.Store(false)
+				continue
+			}
+			
+			// Try to claim
+			if frame.pinCount.CompareAndSwap(0, 1) {
+				frame.metaMutex.Lock()
+				oldPageID := frame.pageID
+				isDirty := frame.dirty.Load()
+				frame.pageID = common.PageID{}
+				frame.metaMutex.Unlock()
+				
+				return frame, oldPageID, isDirty
+			}
+		}
+	}
+	
+	return nil, common.PageID{}, false
+}
+
 func (bp *BufferPool) UnpinPage(frame *PageFrame, setDirty bool) {
-	panic("unimplemented")
+	if setDirty {
+		frame.dirty.Store(true)
+	}
+	frame.pinCount.Add(-1)
 }
 
-// FlushAllPages flushes all dirty pages to disk that have an LSN less than `flushedUntil`, regardless of pins.
-// This is typically called during a Checkpoint or Shutdown to ensure durability, but also useful for tests
-//
-// You can ignore the flushedUntil argument until lab 4
 func (bp *BufferPool) FlushAllPages(flushedUntil common.LSN) error {
-	panic("unimplemented")
+	for _, frame := range bp.frames {
+		// Hold metaMutex to get consistent pageID and dirty state
+		frame.metaMutex.Lock()
+		pageID := frame.pageID
+		isDirty := frame.dirty.Load()
+		frame.metaMutex.Unlock()
+		
+		if pageID.Oid == 0 {
+			continue // empty frame
+		}
+		
+		if isDirty {
+			file, err := bp.storageManager.GetDBFile(pageID.Oid)
+			if err != nil {
+				return err
+			}
+			
+			// Hold RLock while reading bytes to avoid race with writers
+			frame.PageLatch.RLock()
+			// Re-verify pageID hasn't changed while we were getting the lock
+			frame.metaMutex.Lock()
+			currentPageID := frame.pageID
+			frame.metaMutex.Unlock()
+			
+			if currentPageID == pageID {
+				err = file.WritePage(int(pageID.PageNum), frame.Bytes[:])
+				if err == nil {
+					frame.dirty.Store(false)
+				}
+			}
+			frame.PageLatch.RUnlock()
+			
+			if currentPageID != pageID {
+				continue // Frame was reused, skip
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
-// GetDirtyPageTableSnapshot returns a map of all currently dirty pages and their RecoveryLSN.
-// This is used by the Recovery Manager (ARIES) during the Analysis phase to reconstruct the
-// state of the database.
-//
-// Hint: You do not need to worry about this function until lab 4
 func (bp *BufferPool) GetDirtyPageTableSnapshot() map[common.PageID]common.LSN {
-	// You will not need to implement this until lab4
-	panic("unimplemented")
+	return make(map[common.PageID]common.LSN)
 }

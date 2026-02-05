@@ -30,8 +30,16 @@ type PageFrame struct {
 	Bytes [common.PageSize]byte
 	// PageLatch protects the content of the page from concurrent access.
 	PageLatch sync.RWMutex
-	// Hint: You will need to add fields and synchronization structures here to track the state of this frame.
+
+	// Metadata for buffer pool management (using atomics for lock-free hot path)
+	pageID      common.PageID
+	pinCount    atomic.Int32 // Atomic for fast pin/unpin
+	dirty       atomic.Bool  // Atomic for fast dirty checks
+	refBit      atomic.Bool  // Atomic for Clock algorithm
+	recoveryLSN common.LSN
+	metaMutex   sync.Mutex // Protects pageID, recoveryLSN, and complex operations
 }
+
 
 // Detect system endianness -- compiler should statically replace this with a constant
 var isBigEndian = func() bool {
