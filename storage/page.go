@@ -36,10 +36,10 @@ type PageFrame struct {
 	pinCount    atomic.Int32 // Atomic for fast pin/unpin
 	dirty       atomic.Bool  // Atomic for fast dirty checks
 	refBit      atomic.Bool  // Atomic for Clock algorithm
+	evicting    atomic.Bool  // True while frame is being reclaimed/reloaded
 	recoveryLSN common.LSN
 	metaMutex   sync.Mutex // Protects pageID, recoveryLSN, and complex operations
 }
-
 
 // Detect system endianness -- compiler should statically replace this with a constant
 var isBigEndian = func() bool {
